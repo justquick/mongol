@@ -1,0 +1,9 @@
+[washingtontimes.com]
+output = ./reports
+time = days:2
+
+mapper =
+    function () {
+        if (this.site == 'washingtontimes.com')
+            emit({url:this.url, title:this.title}, this.pageviews);
+    }

@@ -1,0 +1,106 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import decimal
+from datetime import datetime, timedelta, date, time
+from ConfigParser import RawConfigParser
+try:
+    import json
+except ImportError:
+    import simplejson as json
+
+from pymongo import Connection, DESCENDING, ASCENDING
+from pymongo.objectid import ObjectId
+from pymongo.code import Code
+
+OUT = os.path.join(os.path.dirname(__file__), 'reports')
+
+DATE_FORMAT = '%b %d, %Y'
+TIME_FORMAT = '%H:%M:%S'
+DEFAULT_MAPPER = """
+function () {
+    emit({url:this.url, title:this.title}, this.pageviews);
+}
+"""
+DEFAULT_REDUCER = """
+function (key, values) {
+    var total = 0;
+    for (var i = 0; i < values.length; i++) {
+        total += values[i];
+    }
+    return total;
+}
+"""
+
+def new_date(d):
+    "Generate a safe date from a datetime.date object."
+    return date(d.year, d.month, d.day)
+
+def new_datetime(d):
+    """
+    Generate a safe datetime from a datetime.date or datetime.datetime object.
+    """
+    kw = [d.year, d.month, d.day]
+    if isinstance(d, datetime):
+        kw.extend([d.hour, d.minute, d.second, d.microsecond, d.tzinfo])
+    return datetime(*kw)
+
+class JSONEncoder(json.JSONEncoder):
+    """
+    JSONEncoder subclass that knows how to encode date/time, decimal types and pymongo ObjectId.
+    """
+    def default(self, o):
+        if isinstance(o, datetime):
+            return new_datetime(o).strftime("%s %s" % (DATE_FORMAT, TIME_FORMAT))
+        elif isinstance(o, date):
+            return new_date(o).strftime(DATE_FORMAT)
+        elif isinstance(o, time):
+            return o.strftime(TIME_FORMAT)
+        elif isinstance(o, decimal.Decimal) or isinstance(o, ObjectId):
+            return str(o)
+        else:
+            return super(JSONEncoder, self).default(o)
+
+dumps = lambda o: json.dumps(o, cls=JSONEncoder)
+timeparse = lambda **kw: datetime.now() - timedelta(**kw)
+db = Connection().mongol
+
+if len(sys.argv) != 2:
+    print 'Please pass in a configuration file as last argument'
+    sys.exit(1)
+    
+if not os.path.exists(sys.argv[-1]):
+    print 'Config file "%s" not found' % sys.argv[-1]
+    sys.exit(1)
+
+config = RawConfigParser()
+config.read(sys.argv[-1])
+
+for section in config.sections():
+    # Gather config parameters
+    output = os.path.expanduser(config.get(section, 'output'))
+    if not os.path.exists(output):
+        os.mkdir(output)
+    limit = config.has_option(section, 'limit') and config.getint(section, 'limit') or 10
+    order = config.has_option(section, 'order') and config.get(section, 'order') or 'D'
+    order = order == 'D' and DESCENDING or ASCENDING
+    time = config.has_option(section, 'time') and config.get(section, 'time') or None
+    if time:
+        time = timeparse(**dict([(x.split(':')[0], int(x.split(':')[1])) for x in time.split()]))
+    callback = config.has_option(section, 'callback') and config.get(section, 'callback') or 'results'
+    mapper = Code(config.has_option(section, 'mapper') and config.get(section, 'mapper') or DEFAULT_MAPPER)
+    reducer = Code(config.has_option(section, 'reducer') and config.get(section, 'reducer') or DEFAULT_REDUCER)
+
+    # Perform Map/Reduce query for result set
+    results = db.analytics.map_reduce(mapper, reducer)
+    results = [doc['_id'] for doc in results.find().sort('value', order).limit(limit)]
+    
+    # Serialize data w/ JSONP callback
+    f = open(os.path.join(output, '%s.json' % section), 'w')
+    f.write('%s(%s)' % (callback, dumps(results)) )
+    f.close() 
+    
+    # Cleanup old records
+    if time:
+        db.analytics.remove({'time': {'$lte':time}, 'site':section})

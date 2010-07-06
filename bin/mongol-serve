@@ -1,0 +1,125 @@
+#!/usr/bin/env python
+
+import sys
+import os
+from urlparse import parse_qs
+from datetime import datetime
+from pymongo import Connection
+
+
+# 1x1 Transparent GIF image with proper cache control/expires headers
+GIF_CONTENT = 'GIF89a\x01\x00\x01\x00\x91\x00\x00\xff\xff\xff\xff\xff\xff\xfe\
+\x01\x02\x00\x00\x00!\xf9\x04\x04\x14\x00\xff\x00,\x00\x00\x00\x00\x01\x00\x01\
+\x00\x00\x02\x02D\x01\x00;'
+GIF_HEADERS = {
+    'Content-type': 'image/gif',
+    'Content-length': str(len(GIF_CONTENT)),
+    'Pragma': 'no-cache',
+    'Expires': 'Wed, 19 Apr 2000 11:43:00 GMT',
+    'Last-Modified': 'Wed, 19 Apr 2000 11:43:00 GMT',
+    'Cache-Control': 'private, no-cache, no-cache=Set-Cookie, proxy-revalidate'
+}
+
+def _parse_qs(qs):
+    """
+    Parse a query string returning a dictionary.
+    Multiple values are kept as lists while singles just resolve
+    """
+    for k,v in parse_qs(qs, 1).items():
+        if len(v) == 1:
+            yield k,v[0] # Single value
+        else:
+            yield k,v # List of multiple values
+
+class WSGIHandler(object):
+    headers = {'Content-type':'text/plain'}
+    responses = {
+        200: 'OK',
+        400: 'BAD REQUEST',
+        404: 'NOT FOUND',
+        503: 'SERVICE UNAVAILABLE',
+        500: 'INTERNAL SERVER ERROR'
+    }
+    
+    def do_response(self, start_response, code, headers={}):
+        h = self.headers.copy()
+        h.update(headers)
+        start_response('%d %s' % (code, self.responses[code]), h.items())
+        return self.responses[code].title()
+        
+    def _400(self, start_response):
+        return self.do_response(start_response, 400)
+    
+    def _404(self, start_response):
+        return self.do_response(start_response, 404)
+
+    def _503(self, start_response):
+        return self.do_response(start_response, 503)
+    
+    def _500(self, start_response):
+        return self.do_response(start_response, 500)
+
+    def _200(self, start_response, headers):
+        return self.do_response(start_response, 200, headers)
+
+    def __call__(self, environ, start_response):
+        try:
+            return self.track(environ, start_response)
+        except:
+            return self._500(start_response)
+    
+    def track(self, environ, start_response):
+        data = {'time': datetime.utcnow().replace(second=0,microsecond=0)}
+        data.update(dict(_parse_qs(environ.get('QUERY_STRING',''))))
+        referer = environ.get('HTTP_REFERER','') or None
+        url_site = ('url' in data and 'site' in data)
+        if not (url_site or referer):
+            return self._400(start_response)
+        if referer and not url_site:
+            a = referer.split('/')
+            data['site'], data['url'] = a[2], '/' + '/'.join(a[3:])
+        data['site'] = data['site'].replace('www.','')
+        try:
+            self.db.update(data, {'$inc': {'pageviews':1}}, upsert=True)
+        except:
+            return self._503(start_response)
+        self._200(start_response, GIF_HEADERS)
+        return GIF_CONTENT
+    
+    def db(self):
+        if hasattr(self, '_db'):
+            return self._db
+        self._db = Connection().mongol.analytics
+        return self._db
+    db = property(db)
+    
+application = WSGIHandler()
+
+if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        addr, port = '', '8000'
+    else:
+        try:
+            addr, port = sys.argv[-1].split(':')
+        except ValueError:
+            addr, port = '', sys.argv[-1]
+    if not addr:
+        addr = '0.0.0.0'
+    print "Serving on %s:%s..." % (addr, port)
+    try:
+        from gevent import wsgi
+        
+        wsgi.WSGIServer((addr, int(port)), application).serve_forever()
+    except ImportError:
+        try:
+            from tornado.wsgi import WSGIContainer
+            from tornado.httpserver import HTTPServer
+            from tornado.ioloop import IOLoop
+            
+            http_server = HTTPServer(WSGIContainer(application))
+            http_server.listen(int(port), addr)
+            IOLoop.instance().start()
+        except ImportError:
+            from wsgiref.simple_server import make_server
+            
+            make_server(addr, int(port), application).serve_forever()
